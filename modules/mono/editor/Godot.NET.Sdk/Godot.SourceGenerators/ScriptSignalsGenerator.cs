@@ -121,6 +121,8 @@ namespace Godot.SourceGenerators
             source.Append(symbol.NameWithTypeParameters());
             source.Append("\n{\n");
 
+            List<GodotSignalData> godotSignals = new();
+
             var members = symbol.GetMembers();
 
             var signalDelegateSymbols = members
@@ -129,8 +131,6 @@ namespace Godot.SourceGenerators
                 .Where(namedTypeSymbol => namedTypeSymbol.TypeKind == TypeKind.Delegate)
                 .Where(s => s.GetAttributes()
                     .Any(a => a.AttributeClass?.IsGodotSignalAttribute() ?? false));
-
-            List<GodotSignalDelegateData> godotSignalDelegates = new();
 
             foreach (var signalDelegateSymbol in signalDelegateSymbols)
             {
@@ -143,39 +143,30 @@ namespace Godot.SourceGenerators
                 string signalName = signalDelegateSymbol.Name;
                 signalName = signalName.Substring(0, signalName.Length - SignalDelegateSuffix.Length);
 
-                var invokeMethodData = signalDelegateSymbol
-                    .DelegateInvokeMethod?.HasGodotCompatibleSignature(typeCache);
+                var invokeMethodData = GetInvokeMethodData(signalDelegateSymbol, context, typeCache);
 
-                if (invokeMethodData == null)
+                if (invokeMethodData is not null)
                 {
-                    if (signalDelegateSymbol.DelegateInvokeMethod is IMethodSymbol methodSymbol)
-                    {
-                        foreach (var parameter in methodSymbol.Parameters)
-                        {
-                            if (parameter.RefKind != RefKind.None)
-                            {
-                                Common.ReportSignalParameterTypeNotSupported(context, parameter);
-                                continue;
-                            }
-
-                            var marshalType = MarshalUtils.ConvertManagedTypeToMarshalType(parameter.Type, typeCache);
-
-                            if (marshalType == null)
-                            {
-                                Common.ReportSignalParameterTypeNotSupported(context, parameter);
-                            }
-                        }
-
-                        if (!methodSymbol.ReturnsVoid)
-                        {
-                            Common.ReportSignalDelegateSignatureMustReturnVoid(context, signalDelegateSymbol);
-                        }
-                    }
-
-                    continue;
+                    godotSignals.Add(new GodotSignalData(signalName, true, signalDelegateSymbol, invokeMethodData.Value));
                 }
+            }
 
-                godotSignalDelegates.Add(new(signalName, signalDelegateSymbol, invokeMethodData.Value));
+            var signalEventSymbols = members
+                .Where(s => s.Kind == SymbolKind.Event)
+                .Cast<IEventSymbol>()
+                .Where(s => s.GetAttributes()
+                    .Any(a => a.AttributeClass?.IsGodotSignalAttribute() ?? false));
+
+            foreach (var signalEventSymbol in signalEventSymbols)
+            {
+                var signalDelegateSymbol = (INamedTypeSymbol) signalEventSymbol.Type;
+
+                var invokeMethodData = GetInvokeMethodData(signalDelegateSymbol, context, typeCache);
+
+                if (invokeMethodData is not null)
+                {
+                    godotSignals.Add(new GodotSignalData(signalEventSymbol.Name, false, signalDelegateSymbol, invokeMethodData.Value));
+                }
             }
 
             source.Append("#pragma warning disable CS0109 // Disable warning about redundant 'new' keyword\n");
@@ -189,9 +180,9 @@ namespace Godot.SourceGenerators
 
             // Generate cached StringNames for methods and properties, for fast lookup
 
-            foreach (var signalDelegate in godotSignalDelegates)
+            foreach (var signal in godotSignals)
             {
-                string signalName = signalDelegate.Name;
+                string signalName = signal.Name;
 
                 source.Append("        /// <summary>\n")
                     .Append("        /// Cached name for the '")
@@ -210,7 +201,7 @@ namespace Godot.SourceGenerators
 
             // Generate GetGodotSignalList
 
-            if (godotSignalDelegates.Count > 0)
+            if (godotSignals.Count > 0)
             {
                 const string listType = "global::System.Collections.Generic.List<global::Godot.Bridge.MethodInfo>";
 
@@ -229,12 +220,12 @@ namespace Godot.SourceGenerators
                 source.Append("        var signals = new ")
                     .Append(listType)
                     .Append("(")
-                    .Append(godotSignalDelegates.Count)
+                    .Append(godotSignals.Count)
                     .Append(");\n");
 
-                foreach (var signalDelegateData in godotSignalDelegates)
+                foreach (var signal in godotSignals)
                 {
-                    var methodInfo = DetermineMethodInfo(signalDelegateData);
+                    var methodInfo = DetermineMethodInfo(signal);
                     AppendMethodInfo(source, methodInfo);
                 }
 
@@ -246,25 +237,30 @@ namespace Godot.SourceGenerators
 
             // Generate signal event
 
-            foreach (var signalDelegate in godotSignalDelegates)
+            foreach (var signal in godotSignals)
             {
-                string signalName = signalDelegate.Name;
+                if (!signal.IsDelegate)
+                {
+                    continue;
+                }
+
+                string signalName = signal.Name;
 
                 // TODO: Hide backing event from code-completion and debugger
                 // The reason we have a backing field is to hide the invoke method from the event,
                 // as it doesn't emit the signal, only the event delegates. This can confuse users.
                 // Maybe we should directly connect the delegates, as we do with native signals?
                 source.Append("    private ")
-                    .Append(signalDelegate.DelegateSymbol.FullQualifiedNameIncludeGlobal())
+                    .Append(signal.DelegateSymbol.FullQualifiedNameIncludeGlobal())
                     .Append(" backing_")
                     .Append(signalName)
                     .Append(";\n");
 
                 source.Append(
-                    $"    /// <inheritdoc cref=\"{signalDelegate.DelegateSymbol.FullQualifiedNameIncludeGlobal()}\"/>\n");
+                    $"    /// <inheritdoc cref=\"{signal.DelegateSymbol.FullQualifiedNameIncludeGlobal()}\"/>\n");
 
                 source.Append("    public event ")
-                    .Append(signalDelegate.DelegateSymbol.FullQualifiedNameIncludeGlobal())
+                    .Append(signal.DelegateSymbol.FullQualifiedNameIncludeGlobal())
                     .Append(" ")
                     .Append(signalName)
                     .Append(" {\n")
@@ -279,7 +275,7 @@ namespace Godot.SourceGenerators
 
             // Generate RaiseGodotClassSignalCallbacks
 
-            if (godotSignalDelegates.Count > 0)
+            if (godotSignals.Count > 0)
             {
                 source.Append("    /// <inheritdoc/>\n");
                 source.Append("    [global::System.ComponentModel.EditorBrowsable(global::System.ComponentModel.EditorBrowsableState.Never)]\n");
@@ -287,7 +283,7 @@ namespace Godot.SourceGenerators
                     "    protected override void RaiseGodotClassSignalCallbacks(in godot_string_name signal, ");
                 source.Append("NativeVariantPtrArgs args)\n    {\n");
 
-                foreach (var signal in godotSignalDelegates)
+                foreach (var signal in godotSignals)
                 {
                     GenerateSignalEventInvoker(signal, source);
                 }
@@ -299,7 +295,7 @@ namespace Godot.SourceGenerators
 
             // Generate HasGodotClassSignal
 
-            if (godotSignalDelegates.Count > 0)
+            if (godotSignals.Count > 0)
             {
                 source.Append("    /// <inheritdoc/>\n");
                 source.Append("    [global::System.ComponentModel.EditorBrowsable(global::System.ComponentModel.EditorBrowsableState.Never)]\n");
@@ -307,7 +303,7 @@ namespace Godot.SourceGenerators
                     "    protected override bool HasGodotClassSignal(in godot_string_name signal)\n    {\n");
 
                 bool isFirstEntry = true;
-                foreach (var signal in godotSignalDelegates)
+                foreach (var signal in godotSignals)
                 {
                     GenerateHasSignalEntry(signal.Name, source, isFirstEntry);
                     isFirstEntry = false;
@@ -338,6 +334,45 @@ namespace Godot.SourceGenerators
             }
 
             context.AddSource(uniqueHint, SourceText.From(source.ToString(), Encoding.UTF8));
+        }
+
+        private static GodotMethodData? GetInvokeMethodData(
+            INamedTypeSymbol signalDelegateSymbol,
+            GeneratorExecutionContext context,
+            MarshalUtils.TypeCache typeCache
+        )
+        {
+            var invokeMethodData = signalDelegateSymbol
+                .DelegateInvokeMethod?.HasGodotCompatibleSignature(typeCache);
+
+            if (invokeMethodData != null)
+                return invokeMethodData;
+
+            if (signalDelegateSymbol.DelegateInvokeMethod is not IMethodSymbol methodSymbol)
+                return null;
+
+            foreach (var parameter in methodSymbol.Parameters)
+            {
+                if (parameter.RefKind != RefKind.None)
+                {
+                    Common.ReportSignalParameterTypeNotSupported(context, parameter);
+                    continue;
+                }
+
+                var marshalType = MarshalUtils.ConvertManagedTypeToMarshalType(parameter.Type, typeCache);
+
+                if (marshalType == null)
+                {
+                    Common.ReportSignalParameterTypeNotSupported(context, parameter);
+                }
+            }
+
+            if (!methodSymbol.ReturnsVoid)
+            {
+                Common.ReportSignalDelegateSignatureMustReturnVoid(context, signalDelegateSymbol);
+            }
+
+            return null;
         }
 
         private static void AppendMethodInfo(StringBuilder source, MethodInfo methodInfo)
@@ -397,9 +432,9 @@ namespace Godot.SourceGenerators
             source.Append(")");
         }
 
-        private static MethodInfo DetermineMethodInfo(GodotSignalDelegateData signalDelegateData)
+        private static MethodInfo DetermineMethodInfo(GodotSignalData signalData)
         {
-            var invokeMethodData = signalDelegateData.InvokeMethodData;
+            var invokeMethodData = signalData.InvokeMethodData;
 
             PropertyInfo returnVal;
 
@@ -435,7 +470,7 @@ namespace Godot.SourceGenerators
                 arguments = null;
             }
 
-            return new MethodInfo(signalDelegateData.Name, returnVal, MethodFlags.Default, arguments,
+            return new MethodInfo(signalData.Name, returnVal, MethodFlags.Default, arguments,
                 defaultArguments: null);
         }
 
@@ -473,7 +508,7 @@ namespace Godot.SourceGenerators
         }
 
         private static void GenerateSignalEventInvoker(
-            GodotSignalDelegateData signal,
+            GodotSignalData signal,
             StringBuilder source
         )
         {
@@ -485,7 +520,13 @@ namespace Godot.SourceGenerators
             source.Append(" && args.Count == ");
             source.Append(invokeMethodData.ParamTypes.Length);
             source.Append(") {\n");
-            source.Append("            backing_");
+            source.Append("            ");
+
+            if (signal.IsDelegate)
+            {
+                source.Append("backing_");
+            }
+
             source.Append(signalName);
             source.Append("?.Invoke(");
 
